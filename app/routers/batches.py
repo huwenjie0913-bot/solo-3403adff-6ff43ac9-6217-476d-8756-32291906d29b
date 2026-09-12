@@ -11,6 +11,7 @@ from ..models import Batch
 from ..schemas import (
     BatchCreate,
     BatchOut,
+    CalibrateRequest,
     CalibrationOut,
     RunCreate,
     RunOut,
@@ -36,6 +37,7 @@ def _batch_out(batch: Batch) -> BatchOut:
         run_count=len(batch.runs),
         calibrated=batch.calibration is not None,
         solution_count=len(batch.solutions),
+        runout_profile_count=len(batch.runout_profiles),
     )
 
 
@@ -68,9 +70,17 @@ def list_runs(batch_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{batch_id}/calibrate", response_model=CalibrationOut)
-def calibrate(batch_id: int, db: Session = Depends(get_db)):
-    """按试重前后差分拟合影响系数矩阵，返回系数、拟合残差与测量来源。"""
-    return services.calibrate(db, batch_id)
+def calibrate(
+    batch_id: int,
+    payload: CalibrateRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """按试重前后差分拟合影响系数矩阵，返回系数、拟合残差与测量来源。
+
+    可指定轴跳档案：先从各运行原始振动矢量扣除轴跳再拟合。
+    """
+    req = payload or CalibrateRequest()
+    return services.calibrate(db, batch_id, req.runout_profile_id)
 
 
 @router.get("/{batch_id}/calibration", response_model=CalibrationOut)

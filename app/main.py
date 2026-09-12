@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 
 from .database import init_db
 from .errors import DomainError
-from .routers import batches, solutions
+from .routers import batches, runout, solutions
 
 
 @asynccontextmanager
@@ -21,11 +21,11 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="双面现场动平衡 API",
     description=(
-        "面向旋转设备检修的双面现场动平衡：幅相差分拟合影响系数矩阵，"
-        "连续配重求解与离散可安装组合搜索，公差最差情形评估，"
-        "复测对比与 JSON 平衡记录导出。"
+        "面向旋转设备检修的双面现场动平衡：慢转轴跳档案与矢量扣除，"
+        "幅相差分拟合影响系数矩阵，连续配重求解与离散可安装组合搜索，"
+        "公差最差情形评估与净振动可分辨判定，复测对比与 JSON 平衡记录导出。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -44,4 +44,5 @@ def health() -> dict:
 
 
 app.include_router(batches.router)
+app.include_router(runout.router)
 app.include_router(solutions.router)

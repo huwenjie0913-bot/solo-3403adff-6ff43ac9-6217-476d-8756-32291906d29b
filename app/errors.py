@@ -54,3 +54,15 @@ class NoFeasibleCombination(DomainError):
 
 class CalibrationMissing(DomainError):
     code = "calibration_missing"
+
+
+class RunoutProfileInvalid(DomainError):
+    """轴跳档案不满足使用条件（测点缺失、超速、离散度超限等）。"""
+
+    code = "runout_profile_invalid"
+
+
+class RunoutPhaseReferenceConflict(DomainError):
+    """轴跳记录与被补偿测量的相位基准约定不一致。"""
+
+    code = "runout_phase_reference_conflict"

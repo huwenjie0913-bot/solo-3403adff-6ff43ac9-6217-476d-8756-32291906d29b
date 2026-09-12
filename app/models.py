@@ -35,12 +35,22 @@ class Batch(Base):
     runs: Mapped[list["Run"]] = relationship(
         back_populates="batch", cascade="all, delete-orphan", order_by="Run.id"
     )
-    calibration: Mapped["Calibration | None"] = relationship(
-        back_populates="batch", cascade="all, delete-orphan", uselist=False
+    runout_profiles: Mapped[list["RunoutProfile"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan",
+        order_by="RunoutProfile.id",
+    )
+    calibrations: Mapped[list["Calibration"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan",
+        order_by="Calibration.id",
     )
     solutions: Mapped[list["Solution"]] = relationship(
         back_populates="batch", cascade="all, delete-orphan", order_by="Solution.id"
     )
+
+    @property
+    def calibration(self) -> "Calibration | None":
+        """最新一次标定（不同轴跳档案可产生多份标定）。"""
+        return self.calibrations[-1] if self.calibrations else None
 
 
 class Run(Base):
@@ -61,20 +71,70 @@ class Run(Base):
     batch: Mapped[Batch] = relationship(back_populates="runs")
 
 
+class RunoutProfile(Base):
+    """慢转轴跳档案：一组慢转记录的逐测点复矢量统计与有效性问题。"""
+
+    __tablename__ = "runout_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(200))
+    slow_roll_speed_limit: Mapped[float] = mapped_column(Float)   # 慢转转速上限 rpm
+    dispersion_limit: Mapped[float] = mapped_column(Float)        # 重复测量离散度阈值（振幅单位）
+    summary: Mapped[dict] = mapped_column(JSON)                   # 逐测点均值/离散度统计
+    issues: Mapped[list] = mapped_column(JSON, default=list)      # 档案有效性问题清单
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    batch: Mapped[Batch] = relationship(back_populates="runout_profiles")
+    records: Mapped[list["RunoutRecord"]] = relationship(
+        back_populates="profile", cascade="all, delete-orphan",
+        order_by="RunoutRecord.id",
+    )
+
+    @property
+    def usable(self) -> bool:
+        """档案是否通过全部使用前校验（无任何有效性问题）。"""
+        return not self.issues
+
+
+class RunoutRecord(Base):
+    """一条慢转记录：转速、相位基准及各测点 1X 振幅/相位。"""
+
+    __tablename__ = "runout_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        ForeignKey("runout_profiles.id", ondelete="CASCADE")
+    )
+    speed: Mapped[float] = mapped_column(Float)
+    phase_reference: Mapped[str] = mapped_column(String(50))
+    measurements: Mapped[list] = mapped_column(JSON)   # [{sensor, amplitude, phase}]
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    profile: Mapped[RunoutProfile] = relationship(back_populates="records")
+
+
 class Calibration(Base):
     """影响系数标定结果及其测量来源。"""
 
     __tablename__ = "calibrations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id", ondelete="CASCADE"), unique=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id", ondelete="CASCADE"))
+    runout_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runout_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     coefficients: Mapped[dict] = mapped_column(JSON)   # {sensor: {plane: {real, imag, magnitude, phase}}}
     residuals: Mapped[list] = mapped_column(JSON)      # [{run_id, sensor, amplitude, phase, relative}]
     condition: Mapped[float] = mapped_column(Float)
     provenance: Mapped[dict] = mapped_column(JSON)     # 基线/试重运行 id、测点、校正面、时间
+    # 轴跳补偿快照：使用的档案 id/名称、限值、逐测点原始/补偿/净振动与可分辨范围
+    runout_compensation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
-    batch: Mapped[Batch] = relationship(back_populates="calibration")
+    batch: Mapped[Batch] = relationship(back_populates="calibrations")
 
 
 class Solution(Base):
@@ -84,6 +144,9 @@ class Solution(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id", ondelete="CASCADE"))
+    runout_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runout_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     kind: Mapped[str] = mapped_column(String(20))                  # continuous | discrete
     rank: Mapped[int] = mapped_column(Integer, default=0)
     weights: Mapped[list] = mapped_column(JSON)          # [{plane, mass, angle, assignments?}]
@@ -91,6 +154,9 @@ class Solution(Base):
     predicted_metric: Mapped[float] = mapped_column(Float)
     total_mass: Mapped[float] = mapped_column(Float)
     worst_case: Mapped[float] = mapped_column(Float)
+    # 净残振可分辨范围与逐测点/总体不可判定标记
+    resolution: Mapped[dict] = mapped_column(JSON, default=dict)
+    runout_compensation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
     batch: Mapped[Batch] = relationship(back_populates="solutions")
@@ -106,9 +172,12 @@ class Verification(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     solution_id: Mapped[int] = mapped_column(ForeignKey("solutions.id", ondelete="CASCADE"))
+    runout_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("runout_profiles.id", ondelete="SET NULL"), nullable=True
+    )
     speed: Mapped[float] = mapped_column(Float)
     measurements: Mapped[list] = mapped_column(JSON)   # [{sensor, amplitude, phase}]
-    comparison: Mapped[dict] = mapped_column(JSON)     # 预测 vs 实测偏差
+    comparison: Mapped[dict] = mapped_column(JSON)     # 预测 vs 实测偏差（含轴跳补偿明细）
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 

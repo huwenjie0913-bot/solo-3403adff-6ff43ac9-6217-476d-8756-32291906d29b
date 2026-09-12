@@ -1,4 +1,4 @@
-"""业务编排：校验、标定、求解、复测、导出。"""
+"""业务编排：校验、标定、求解、复测、导出，以及慢转轴跳补偿。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,10 @@ from sqlalchemy.orm import Session
 from .core.correction import solve_continuous
 from .core.discrete import search_discrete_solutions, worst_case_residual
 from .core.influence import fit_influence_coefficients
+from .core.runout import (
+    build_runout_summary,
+    compensate_vectors,
+)
 from .core.vibration import amp_phase_to_complex, complex_to_amp_phase
 from .errors import (
     CalibrationMissing,
@@ -17,10 +21,27 @@ from .errors import (
     InsufficientTrials,
     NotFoundError,
     PhaseReferenceConflict,
+    RunoutPhaseReferenceConflict,
+    RunoutProfileInvalid,
     SpeedDeviationError,
 )
-from .models import Batch, Calibration, Run, Solution, Verification
-from .schemas import BatchCreate, RunCreate, SolveRequest, VerificationCreate
+from .models import (
+    Batch,
+    Calibration,
+    Run,
+    RunoutProfile,
+    RunoutRecord,
+    Solution,
+    Verification,
+)
+from .schemas import (
+    BatchCreate,
+    RunCreate,
+    RunoutProfileCreate,
+    RunoutRecordCreate,
+    SolveRequest,
+    VerificationCreate,
+)
 
 
 # ---------------------------------------------------------------- 工具
@@ -142,11 +163,277 @@ def add_run(db: Session, batch_id: int, payload: RunCreate) -> Run:
     return run
 
 
+# ---------------------------------------------------------------- 慢转轴跳档案
+
+
+def _record_dicts(profile: RunoutProfile) -> list[dict]:
+    return [
+        {
+            "id": r.id,
+            "speed": r.speed,
+            "phase_reference": r.phase_reference,
+            "measurements": r.measurements,
+        }
+        for r in profile.records
+    ]
+
+
+def _profile_issues(profile: RunoutProfile, records: list[dict],
+                    sensors: list[str]) -> list[dict]:
+    """计算档案有效性问题：超速、测点缺失/未知/重复、基准不一致、离散度超限。"""
+    issues: list[dict] = []
+    sensor_set = set(sensors)
+
+    if len(records) < 1:
+        issues.append({
+            "code": "insufficient_records",
+            "record_count": 0,
+            "required": 1,
+        })
+
+    # 记录超速
+    over = [
+        {"record_id": r["id"], "speed": r["speed"],
+         "excess": float(r["speed"] - profile.slow_roll_speed_limit)}
+        for r in records
+        if r["speed"] > profile.slow_roll_speed_limit
+    ]
+    if over:
+        issues.append({
+            "code": "overspeed",
+            "slow_roll_speed_limit": profile.slow_roll_speed_limit,
+            "records": over,
+        })
+
+    # 逐记录测点缺失/未知/重复，并汇总从未出现过的测点
+    coverage: list[dict] = []
+    seen_ever: set[str] = set()
+    for r in records:
+        names = [m["sensor"] for m in r["measurements"]]
+        counts = {n: names.count(n) for n in names}
+        missing = [s for s in sensors if s not in counts]
+        unknown = sorted({n for n in names if n not in sensor_set})
+        duplicate = sorted({n for n, c in counts.items() if c > 1})
+        if missing or unknown or duplicate:
+            coverage.append({
+                "record_id": r["id"],
+                "missing_sensors": missing,
+                "unknown_sensors": unknown,
+                "duplicate_sensors": duplicate,
+            })
+        seen_ever.update(n for n in names if n in sensor_set)
+    without_records = [s for s in sensors if s not in seen_ever]
+    if coverage or without_records:
+        issues.append({
+            "code": "sensor_coverage",
+            "records": coverage,
+            "sensors_without_records": without_records,
+            "expected_sensors": sensors,
+        })
+
+    # 档案内部相位基准一致性
+    refs: dict[str, list[int]] = {}
+    for r in records:
+        refs.setdefault(r["phase_reference"], []).append(r["id"])
+    if len(refs) > 1:
+        issues.append({
+            "code": "phase_reference_conflict",
+            "references": {ref: ids for ref, ids in refs.items()},
+        })
+
+    # 逐测点重复测量离散度
+    summary = build_runout_summary(records, sensors)
+    bad_disp = [
+        {
+            "sensor": st.sensor,
+            "dispersion": st.dispersion,
+            "relative_dispersion": st.relative_dispersion,
+            "record_count": st.count,
+        }
+        for st in summary.sensors
+        if st.dispersion > profile.dispersion_limit
+    ]
+    if bad_disp:
+        issues.append({
+            "code": "dispersion_exceeded",
+            "dispersion_limit": profile.dispersion_limit,
+            "sensors": bad_disp,
+        })
+
+    return issues
+
+
+def _recompute_profile(db: Session, profile: RunoutProfile) -> None:
+    """依据当前记录重算逐测点统计与有效性问题并持久化。"""
+    sensors = _sensor_names(profile.batch)
+    records = _record_dicts(profile)
+    profile.summary = build_runout_summary(records, sensors).as_json()
+    profile.issues = _profile_issues(profile, records, sensors)
+    db.flush()
+
+
+def _get_profile_or_404(db: Session, batch: Batch, profile_id: int) -> RunoutProfile:
+    profile = db.get(RunoutProfile, profile_id)
+    if profile is None or profile.batch_id != batch.id:
+        raise NotFoundError(
+            f"轴跳档案 {profile_id} 不存在",
+            {"runout_profile_id": profile_id, "batch_id": batch.id},
+        )
+    return profile
+
+
+def create_runout_profile(
+    db: Session, batch_id: int, payload: RunoutProfileCreate
+) -> RunoutProfile:
+    batch = get_batch_or_404(db, batch_id)
+    profile = RunoutProfile(
+        batch_id=batch.id,
+        name=payload.name,
+        slow_roll_speed_limit=payload.slow_roll_speed_limit,
+        dispersion_limit=payload.dispersion_limit,
+        summary={},
+        issues=[],
+        note=payload.note,
+    )
+    db.add(profile)
+    db.flush()
+    for rec in payload.records:
+        db.add(RunoutRecord(
+            profile_id=profile.id,
+            speed=rec.speed,
+            phase_reference=rec.phase_reference,
+            measurements=[m.model_dump() for m in rec.measurements],
+            note=rec.note,
+        ))
+    db.flush()
+    _recompute_profile(db, profile)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+def add_runout_record(
+    db: Session, batch_id: int, profile_id: int, payload: RunoutRecordCreate
+) -> RunoutProfile:
+    batch = get_batch_or_404(db, batch_id)
+    profile = _get_profile_or_404(db, batch, profile_id)
+    db.add(RunoutRecord(
+        profile_id=profile.id,
+        speed=payload.speed,
+        phase_reference=payload.phase_reference,
+        measurements=[m.model_dump() for m in payload.measurements],
+        note=payload.note,
+    ))
+    db.flush()
+    _recompute_profile(db, profile)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+def _ensure_profile_usable(profile: RunoutProfile) -> None:
+    """档案存在结构性/限值问题时拒绝使用，并指出对应记录与测点。"""
+    if profile.issues:
+        raise RunoutProfileInvalid(
+            f"轴跳档案「{profile.name}」未通过校验，拒绝用于补偿",
+            {
+                "runout_profile_id": profile.id,
+                "runout_profile_name": profile.name,
+                "issues": profile.issues,
+            },
+        )
+
+
+def _runout_mean_vector(profile: RunoutProfile, sensors: list[str]) -> np.ndarray:
+    return np.array([
+        complex(
+            profile.summary[s]["real"],
+            profile.summary[s]["imag"],
+        )
+        for s in sensors
+    ])
+
+
+def _resolve_runout_profile(
+    db: Session, batch: Batch, profile_id: int | None, runs: list[Run]
+) -> tuple[RunoutProfile | None, np.ndarray]:
+    """取出并校验轴跳档案，返回 (档案, 与批次测点对齐的轴跳复矢量)。"""
+    sensors = _sensor_names(batch)
+    if profile_id is None:
+        return None, np.zeros(len(sensors), dtype=complex)
+
+    profile = _get_profile_or_404(db, batch, profile_id)
+    _recompute_profile(db, profile)  # 用前按最新记录重算，问题不入库改动也要提交
+    db.commit()
+    _ensure_profile_usable(profile)
+
+    # 档案内部基准须唯一（issues 已保证），且与被补偿运行的基准一致
+    record_refs = {r.phase_reference for r in profile.records}
+    run_refs = {r.phase_reference for r in runs}
+    if record_refs != run_refs:
+        raise RunoutPhaseReferenceConflict(
+            "轴跳档案与运行的相位基准约定不一致，不能扣除轴跳",
+            {
+                "runout_profile_id": profile.id,
+                "runout_phase_references": sorted(record_refs),
+                "run_phase_references": sorted(run_refs),
+                "run_ids": [r.id for r in runs],
+                "record_ids": [r.id for r in profile.records],
+            },
+        )
+    return profile, _runout_mean_vector(profile, sensors)
+
+
+def _profile_block(profile: RunoutProfile, phase_reference: str | None) -> dict:
+    """档案快照（写入标定/方案/复测与导出，切换或修改档案不影响既得结果）。"""
+    return {
+        "runout_profile_id": profile.id,
+        "runout_profile_name": profile.name,
+        "slow_roll_speed_limit": profile.slow_roll_speed_limit,
+        "dispersion_limit": profile.dispersion_limit,
+        "phase_reference": phase_reference,
+        "summary": profile.summary,
+        "snapshotted_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _compensation_json(comps, dispersion_by_sensor: dict[str, float]) -> tuple[dict, list[str]]:
+    """把逐测点补偿结果转为响应 JSON，返回 (按测点字典, 不可判定测点)。"""
+    out: dict[str, dict] = {}
+    undecidable: list[str] = []
+    for c in comps:
+        out[c.sensor] = {
+            "raw": {"amplitude": c.raw_amplitude, "phase": c.raw_phase},
+            "compensation": {
+                "amplitude": c.compensation_amplitude,
+                "phase": c.compensation_phase,
+            },
+            "net": {"amplitude": c.net_amplitude, "phase": c.net_phase},
+            "dispersion": float(dispersion_by_sensor.get(c.sensor, 0.0)),
+            "resolution": c.resolution,
+            "undecidable": c.undecidable,
+        }
+        if c.undecidable:
+            undecidable.append(c.sensor)
+    return out, undecidable
+
+
 # ---------------------------------------------------------------- 标定
 
 
-def calibrate(db: Session, batch_id: int) -> Calibration:
+def calibrate(
+    db: Session, batch_id: int, runout_profile_id: int | None = None
+) -> Calibration:
     batch = get_batch_or_404(db, batch_id)
+
+    # 档案无效（测点缺失、超速、离散度超限等）时优先拒绝，
+    # 不要求批次先具备完整运行
+    if runout_profile_id is not None:
+        profile_spec = _get_profile_or_404(db, batch, runout_profile_id)
+        _recompute_profile(db, profile_spec)
+        db.commit()
+        _ensure_profile_usable(profile_spec)
+
     runs = list(batch.runs)
     _check_speed(batch, runs)
     _check_phase_reference(batch, runs)
@@ -165,14 +452,23 @@ def calibrate(db: Session, batch_id: int) -> Calibration:
 
     sensors = _sensor_names(batch)
     planes = _plane_names(batch)
-    baseline_vec = _run_vector(baselines[0], sensors)
+
+    # 先扣除慢转轴跳，再做差分拟合（同一均值对各运行作差时会抵消，系数不变，
+    # 基线变为净振动；档案与运行相位基准不一致时直接拒绝）
+    profile, runout_vec = _resolve_runout_profile(
+        db, batch, runout_profile_id, [baselines[0]] + trials
+    )
+
+    raw_baseline = _run_vector(baselines[0], sensors)
+    raw_trials = np.array([_run_vector(r, sensors) for r in trials])
+    baseline_vec = raw_baseline - runout_vec
+    trial_vectors = raw_trials - runout_vec[np.newaxis, :]
 
     trial_matrix = np.zeros((len(trials), len(planes)), dtype=complex)
     for k, run in enumerate(trials):
         for tw in run.trial_weights:
             p = planes.index(tw["plane"])
             trial_matrix[k, p] += amp_phase_to_complex(tw["mass"], tw["angle"])
-    trial_vectors = np.array([_run_vector(r, sensors) for r in trials])
 
     result = fit_influence_coefficients(
         baseline_vec,
@@ -214,18 +510,46 @@ def calibrate(db: Session, batch_id: int) -> Calibration:
         "planes": planes,
         "reference_speed": batch.reference_speed,
         "phase_reference": baselines[0].phase_reference,
+        "runout_profile_id": profile.id if profile else None,
         "calibrated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    if batch.calibration is not None:
-        db.delete(batch.calibration)
-        db.flush()
+    # 轴跳补偿快照：基线 + 各次试重逐测点的原始值/补偿量/净振动
+    runout_compensation = None
+    if profile is not None:
+        dispersion_by = {s: profile.summary[s]["dispersion"] for s in sensors}
+        run_items = []
+        all_undecidable: set[str] = set()
+        for run, raw_vec in [(baselines[0], raw_baseline), *zip(trials, raw_trials)]:
+            comps = compensate_vectors(
+                raw_vec, runout_vec, sensors,
+                batch.amp_error, batch.phase_error,
+            )
+            comp_json, und = _compensation_json(comps, dispersion_by)
+            all_undecidable.update(und)
+            run_items.append({
+                "run_id": run.id, "kind": run.kind, "sensors": comp_json,
+            })
+        runout_compensation = {
+            **_profile_block(profile, baselines[0].phase_reference),
+            "runs": run_items,
+            "undecidable_sensors": sorted(all_undecidable),
+        }
+
+    # 同一档案（含无档案）的旧标定被本次取代；切换档案不删除其它标定
+    for old in list(batch.calibrations):
+        if old.runout_profile_id == runout_profile_id:
+            db.delete(old)
+    db.flush()
+
     cal = Calibration(
         batch_id=batch.id,
+        runout_profile_id=profile.id if profile else None,
         coefficients=coefficients,
         residuals=residuals,
         condition=result.condition,
         provenance=provenance,
+        runout_compensation=runout_compensation,
     )
     db.add(cal)
     db.commit()
@@ -247,9 +571,20 @@ def _coefficient_matrix(cal: Calibration, sensors: list[str], planes: list[str])
 
 def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list[Solution]]:
     batch = get_batch_or_404(db, batch_id)
-    cal = batch.calibration
+    profile_id = req.runout_profile_id
+
+    # 使用与指定档案匹配的标定；没有则按该档案标定（自动扣除轴跳）。
+    # 切换档案不会改写已有的其它标定与方案。
+    cal = next(
+        (
+            c
+            for c in reversed(batch.calibrations)
+            if c.runout_profile_id == profile_id
+        ),
+        None,
+    )
     if cal is None:
-        cal = calibrate(db, batch_id)  # 未标定时自动标定
+        cal = calibrate(db, batch_id, profile_id)
     if cal is None:  # pragma: no cover - 防御
         raise CalibrationMissing("批次尚未标定")
 
@@ -258,7 +593,17 @@ def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list
     alpha = _coefficient_matrix(cal, sensors, planes)
 
     baselines = [r for r in batch.runs if r.kind == "baseline"]
-    v0 = _run_vector(baselines[0], sensors)
+    raw_v0 = _run_vector(baselines[0], sensors)
+    if profile_id is not None:
+        profile = _get_profile_or_404(db, batch, profile_id)
+        _recompute_profile(db, profile)
+        db.commit()
+        _ensure_profile_usable(profile)
+        runout_vec = _runout_mean_vector(profile, sensors)
+    else:
+        profile = None
+        runout_vec = np.zeros(len(sensors), dtype=complex)
+    v0 = raw_v0 - runout_vec
 
     limits = [float(p["mass_limit"]) for p in batch.planes]
     cont = solve_continuous(alpha, v0, limits)
@@ -279,12 +624,6 @@ def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list
         top=req.top,
     )
 
-    # 旧的未复测方案视为被取代，删除；已复测的保留为历史记录
-    for old in list(batch.solutions):
-        if not old.verifications:
-            db.delete(old)
-    db.flush()
-
     def _residual_json(pred: np.ndarray) -> dict:
         out = {}
         for i, s in enumerate(sensors):
@@ -292,11 +631,78 @@ def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list
             out[s] = {"amplitude": amp, "phase": phase}
         return out
 
-    cont_sol = Solution(
-        batch_id=batch.id,
+    # 净残振可分辨范围：净基线由“运行测量 − 慢转均值”得到，
+    # 不确定半径为两次幅相测量误差界之和；落入范围内即不可判定。
+    k_err = batch.amp_error + 2.0 * float(
+        np.sin(np.deg2rad(batch.phase_error) / 2.0)
+    )
+
+    def _resolution_json(pred: np.ndarray) -> tuple[dict, list[str]]:
+        per_sensor, und = {}, []
+        for i, s in enumerate(sensors):
+            res = float((abs(raw_v0[i]) + abs(runout_vec[i])) * k_err)
+            pred_amp = float(abs(pred[i]))
+            flag = bool(pred_amp <= res)
+            per_sensor[s] = {
+                "resolution": res,
+                "predicted_amplitude": pred_amp,
+                "undecidable": flag,
+            }
+            if flag:
+                und.append(s)
+        return {"sensors": per_sensor, "undecidable_sensors": und}, und
+
+    baseline_compensation = None
+    if profile is not None:
+        comps = compensate_vectors(
+            raw_v0, runout_vec, sensors, batch.amp_error, batch.phase_error
+        )
+        dispersion_by = {s: profile.summary[s]["dispersion"] for s in sensors}
+        comp_json, und_baseline = _compensation_json(comps, dispersion_by)
+        baseline_compensation = {
+            **_profile_block(profile, baselines[0].phase_reference),
+            "baseline_run_id": baselines[0].id,
+            "sensors": comp_json,
+            "undecidable_sensors": und_baseline,
+        }
+
+    # 仅取代“同一档案选择”且未复测的旧方案；已复测方案与其它档案的方案保留
+    for old in list(batch.solutions):
+        if not old.verifications and old.runout_profile_id == profile_id:
+            db.delete(old)
+    db.flush()
+
+    pid = profile.id if profile else None
+
+    def _build_solution(kind: str, rank: int, weights_json, pred, total_mass,
+                        masses_per_plane, assignments_worst_case=None) -> Solution:
+        res_json, _ = _resolution_json(pred)
+        return Solution(
+            batch_id=batch.id,
+            runout_profile_id=pid,
+            kind=kind,
+            rank=rank,
+            weights=weights_json,
+            predicted_residual=_residual_json(pred),
+            predicted_metric=float(np.max(np.abs(pred))),
+            total_mass=float(total_mass),
+            worst_case=worst_case_residual(
+                pred,
+                alpha,
+                masses_per_plane,
+                np.abs(v0),
+                batch.amp_error,
+                batch.phase_error,
+                batch.angle_tolerance,
+            ),
+            resolution=res_json,
+            runout_compensation=baseline_compensation,
+        )
+
+    cont_sol = _build_solution(
         kind="continuous",
         rank=0,
-        weights=[
+        weights_json=[
             {
                 "plane": planes[p],
                 "mass": float(abs(cont.weights[p])),
@@ -305,19 +711,9 @@ def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list
             }
             for p in range(len(planes))
         ],
-        predicted_residual=_residual_json(cont.predicted_residual),
-        predicted_metric=float(np.max(np.abs(cont.predicted_residual))),
-        total_mass=float(np.sum(np.abs(cont.weights))),
-        # 连续解按“精确配重以安装角公差安装”评估同一最差情形界
-        worst_case=worst_case_residual(
-            cont.predicted_residual,
-            alpha,
-            [float(abs(w)) for w in cont.weights],
-            np.abs(v0),
-            batch.amp_error,
-            batch.phase_error,
-            batch.angle_tolerance,
-        ),
+        pred=cont.predicted_residual,
+        total_mass=np.sum(np.abs(cont.weights)),
+        masses_per_plane=[float(abs(w)) for w in cont.weights],
     )
     db.add(cont_sol)
     db.flush()
@@ -337,15 +733,16 @@ def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list
                     ],
                 }
             )
-        sol = Solution(
-            batch_id=batch.id,
+        sol = _build_solution(
             kind="discrete",
             rank=rank,
-            weights=weights,
-            predicted_residual=_residual_json(d.predicted_residual),
-            predicted_metric=d.predicted_metric,
+            weights_json=weights,
+            pred=d.predicted_residual,
             total_mass=d.total_mass,
-            worst_case=d.worst_case,
+            masses_per_plane=[
+                float(sum(a.mass for a in d.assignments if a.plane == plane))
+                for plane in planes
+            ],
         )
         db.add(sol)
         discrete_sols.append(sol)
@@ -359,7 +756,9 @@ def solve(db: Session, batch_id: int, req: SolveRequest) -> tuple[Solution, list
 # ---------------------------------------------------------------- 复测
 
 
-def add_verification(db: Session, solution_id: int, payload: VerificationCreate) -> Verification:
+def add_verification(
+    db: Session, solution_id: int, payload: VerificationCreate
+) -> Verification:
     sol = db.get(Solution, solution_id)
     if sol is None:
         raise NotFoundError(f"方案 {solution_id} 不存在", {"solution_id": solution_id})
@@ -384,32 +783,113 @@ def add_verification(db: Session, solution_id: int, payload: VerificationCreate)
         )
 
     baselines = [r for r in batch.runs if r.kind == "baseline"]
-    baseline_by_sensor = {}
-    if baselines:
-        baseline_by_sensor = {m["sensor"]: m for m in baselines[0].measurements}
+    baseline_run = baselines[0] if baselines else None
 
-    comparison: dict = {"sensors": {}, "max_relative_deviation": 0.0}
-    for m in payload.measurements:
-        pred = sol.predicted_residual[m.sensor]
+    # 复测相位基准：显式给定 > 基线约定；须与方案/基线一致
+    expected_ref = baseline_run.phase_reference if baseline_run else None
+    phase_ref = payload.phase_reference or expected_ref
+    if expected_ref is not None and phase_ref != expected_ref:
+        raise PhaseReferenceConflict(
+            "复测相位基准与批次运行不一致",
+            {
+                "references": {
+                    expected_ref: [baseline_run.id] if baseline_run else [],
+                    phase_ref: ["verification"],
+                },
+            },
+        )
+
+    # 轴跳档案：显式指定 > 沿用方案所用档案；先扣除再与方案预测净残振对比
+    profile_id = (
+        payload.runout_profile_id
+        if payload.runout_profile_id is not None
+        else sol.runout_profile_id
+    )
+    runout_vec = np.zeros(len(sensors), dtype=complex)
+    profile = None
+    if profile_id is not None:
+        profile = _get_profile_or_404(db, batch, profile_id)
+        _recompute_profile(db, profile)
+        db.commit()
+        _ensure_profile_usable(profile)
+        record_refs = {r.phase_reference for r in profile.records}
+        if phase_ref is not None and record_refs != {phase_ref}:
+            raise RunoutPhaseReferenceConflict(
+                "轴跳档案与复测的相位基准约定不一致，不能扣除轴跳",
+                {
+                    "runout_profile_id": profile.id,
+                    "runout_phase_references": sorted(record_refs),
+                    "verification_phase_reference": phase_ref,
+                    "record_ids": [r.id for r in profile.records],
+                },
+            )
+        runout_vec = _runout_mean_vector(profile, sensors)
+
+    by_sensor = {m.sensor: m for m in payload.measurements}
+    raw_vec = np.array([
+        amp_phase_to_complex(by_sensor[s].amplitude, by_sensor[s].phase)
+        for s in sensors
+    ])
+    comps = compensate_vectors(
+        raw_vec, runout_vec, sensors, batch.amp_error, batch.phase_error
+    )
+
+    # 基线净振幅：方案扣过速跳时取其补偿快照中的净振动，否则用原始基线
+    baseline_net_amp: dict[str, float] = {}
+    if baseline_run is not None:
+        raw_base = {m["sensor"]: m for m in baseline_run.measurements}
+        block = sol.runout_compensation
+        for s in sensors:
+            if block and s in block["sensors"]:
+                baseline_net_amp[s] = block["sensors"][s]["net"]["amplitude"]
+            else:
+                baseline_net_amp[s] = raw_base[s]["amplitude"]
+
+    dispersion_by = (
+        {s: profile.summary[s]["dispersion"] for s in sensors} if profile else {}
+    )
+    comp_json, undecidable_sensors = _compensation_json(comps, dispersion_by)
+
+    comparison: dict = {
+        "sensors": {},
+        "undecidable_sensors": undecidable_sensors,
+        "balance_verdict": "undecidable" if undecidable_sensors else "decidable",
+    }
+    if profile is not None:
+        comparison["runout_profile"] = _profile_block(profile, phase_ref)
+
+    for i, c in enumerate(comps):
+        pred = sol.predicted_residual[c.sensor]
         z_pred = amp_phase_to_complex(pred["amplitude"], pred["phase"])
-        z_meas = amp_phase_to_complex(m.amplitude, m.phase)
-        dev = abs(z_meas - z_pred)
-        rel = float(dev / max(abs(z_meas), 1e-12))
+        net = raw_vec[i] - runout_vec[i]
+        dev = abs(net - z_pred)
+        rel = float(dev / max(abs(net), 1e-12))
         entry = {
             "predicted": {"amplitude": pred["amplitude"], "phase": pred["phase"]},
-            "measured": {"amplitude": m.amplitude, "phase": m.phase},
+            "raw_measured": {"amplitude": c.raw_amplitude, "phase": c.raw_phase},
+            "runout_compensation": {
+                "amplitude": c.compensation_amplitude,
+                "phase": c.compensation_phase,
+            },
+            "measured": {"amplitude": c.net_amplitude, "phase": c.net_phase},
+            "resolution": c.resolution,
+            "undecidable": c.undecidable,
+            "verdict": "undecidable" if c.undecidable else "decidable",
             "vector_deviation": float(dev),
             "relative_deviation": rel,
         }
-        base = baseline_by_sensor.get(m.sensor)
-        if base and base["amplitude"] > 0:
-            entry["baseline_amplitude"] = base["amplitude"]
-            entry["reduction_ratio"] = float(1.0 - m.amplitude / base["amplitude"])
-        comparison["sensors"][m.sensor] = entry
-        comparison["max_relative_deviation"] = max(comparison["max_relative_deviation"], rel)
+        base_amp = baseline_net_amp.get(c.sensor)
+        if base_amp is not None and base_amp > 0:
+            entry["baseline_amplitude"] = base_amp
+            # 净振动不可分辨时降幅无意义：置空，禁止据此判定平衡达标
+            entry["reduction_ratio"] = (
+                None if c.undecidable else float(1.0 - c.net_amplitude / base_amp)
+            )
+        comparison["sensors"][c.sensor] = entry
 
     ver = Verification(
         solution_id=sol.id,
+        runout_profile_id=profile.id if profile else None,
         speed=payload.speed,
         measurements=[m.model_dump() for m in payload.measurements],
         comparison=comparison,
@@ -424,8 +904,54 @@ def add_verification(db: Session, solution_id: int, payload: VerificationCreate)
 # ---------------------------------------------------------------- 导出
 
 
+def _profile_export(profile: RunoutProfile) -> dict:
+    return {
+        "id": profile.id,
+        "name": profile.name,
+        "slow_roll_speed_limit": profile.slow_roll_speed_limit,
+        "dispersion_limit": profile.dispersion_limit,
+        "summary": profile.summary,
+        "issues": profile.issues,
+        "usable": not profile.issues,
+        "note": profile.note,
+        "created_at": profile.created_at.isoformat(),
+        "records": [
+            {
+                "id": r.id,
+                "speed": r.speed,
+                "phase_reference": r.phase_reference,
+                "measurements": r.measurements,
+                "note": r.note,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in profile.records
+        ],
+    }
+
+
 def export_batch(db: Session, batch_id: int) -> dict:
     batch = get_batch_or_404(db, batch_id)
+
+    # 档案实际使用位置：标定 / 方案 / 复测
+    usage: dict[str, dict] = {}
+    for p in batch.runout_profiles:
+        usage[str(p.id)] = {
+            "runout_profile_id": p.id,
+            "runout_profile_name": p.name,
+            "calibration_ids": [],
+            "solution_ids": [],
+            "verification_ids": [],
+        }
+    for c in batch.calibrations:
+        if c.runout_profile_id and str(c.runout_profile_id) in usage:
+            usage[str(c.runout_profile_id)]["calibration_ids"].append(c.id)
+    for s in batch.solutions:
+        if s.runout_profile_id and str(s.runout_profile_id) in usage:
+            usage[str(s.runout_profile_id)]["solution_ids"].append(s.id)
+        for v in s.verifications:
+            if v.runout_profile_id and str(v.runout_profile_id) in usage:
+                usage[str(v.runout_profile_id)]["verification_ids"].append(v.id)
+
     return {
         "record_type": "two_plane_field_balancing",
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -458,12 +984,30 @@ def export_batch(db: Session, batch_id: int) -> dict:
             }
             for r in batch.runs
         ],
+        "runout_profiles": [_profile_export(p) for p in batch.runout_profiles],
+        "runout_usage": list(usage.values()),
+        "calibrations": [
+            {
+                "id": c.id,
+                "runout_profile_id": c.runout_profile_id,
+                "coefficients": c.coefficients,
+                "residuals": c.residuals,
+                "condition": c.condition,
+                "provenance": c.provenance,
+                "runout_compensation": c.runout_compensation,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in batch.calibrations
+        ],
         "calibration": (
             {
+                "id": batch.calibration.id,
+                "runout_profile_id": batch.calibration.runout_profile_id,
                 "coefficients": batch.calibration.coefficients,
                 "residuals": batch.calibration.residuals,
                 "condition": batch.calibration.condition,
                 "provenance": batch.calibration.provenance,
+                "runout_compensation": batch.calibration.runout_compensation,
                 "created_at": batch.calibration.created_at.isoformat(),
             }
             if batch.calibration
@@ -472,6 +1016,7 @@ def export_batch(db: Session, batch_id: int) -> dict:
         "solutions": [
             {
                 "id": s.id,
+                "runout_profile_id": s.runout_profile_id,
                 "kind": s.kind,
                 "rank": s.rank,
                 "weights": s.weights,
@@ -479,10 +1024,13 @@ def export_batch(db: Session, batch_id: int) -> dict:
                 "predicted_metric": s.predicted_metric,
                 "total_mass": s.total_mass,
                 "worst_case": s.worst_case,
+                "resolution": s.resolution,
+                "runout_compensation": s.runout_compensation,
                 "created_at": s.created_at.isoformat(),
                 "verifications": [
                     {
                         "id": v.id,
+                        "runout_profile_id": v.runout_profile_id,
                         "speed": v.speed,
                         "measurements": v.measurements,
                         "comparison": v.comparison,

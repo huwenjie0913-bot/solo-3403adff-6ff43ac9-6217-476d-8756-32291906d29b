@@ -69,6 +69,7 @@ class BatchOut(ORMModel):
     run_count: int = 0
     calibrated: bool = False
     solution_count: int = 0
+    runout_profile_count: int = 0
 
 
 # ---------------------------------------------------------------- 运行
@@ -115,6 +116,52 @@ class RunOut(ORMModel):
     created_at: datetime
 
 
+# ---------------------------------------------------------------- 慢转轴跳
+
+
+class RunoutRecordCreate(BaseModel):
+    speed: float = Field(..., gt=0, description="慢转实测转速 rpm")
+    phase_reference: str = Field("lag", description="相位基准约定，如 lag/lead")
+    measurements: list[MeasurementIn] = Field(..., min_length=1)
+    note: str = ""
+
+
+class RunoutProfileCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    slow_roll_speed_limit: float = Field(
+        ..., gt=0, description="慢转转速上限 rpm，超过即拒绝使用该档案"
+    )
+    dispersion_limit: float = Field(
+        ..., ge=0, description="重复测量离散度阈值（与振幅同单位）"
+    )
+    records: list[RunoutRecordCreate] = Field(default_factory=list)
+    note: str = ""
+
+
+class RunoutRecordOut(ORMModel):
+    id: int
+    profile_id: int
+    speed: float
+    phase_reference: str
+    measurements: list[MeasurementIn]
+    note: str
+    created_at: datetime
+
+
+class RunoutProfileOut(ORMModel):
+    id: int
+    batch_id: int
+    name: str
+    slow_roll_speed_limit: float
+    dispersion_limit: float
+    summary: dict
+    issues: list[dict]
+    usable: bool
+    note: str
+    created_at: datetime
+    records: list[RunoutRecordOut] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------- 标定
 
 
@@ -127,11 +174,19 @@ class ComplexValue(BaseModel):
 
 class CalibrationOut(ORMModel):
     batch_id: int
+    runout_profile_id: int | None = None
     coefficients: dict[str, dict[str, ComplexValue]]  # sensor -> plane -> 系数
     residuals: list[dict]                              # 逐运行逐测点拟合残差
     condition: float
     provenance: dict                                   # 测量来源
+    runout_compensation: dict | None = None            # 轴跳扣除快照（含逐测点原始/补偿/净振动）
     created_at: datetime
+
+
+class CalibrateRequest(BaseModel):
+    runout_profile_id: int | None = Field(
+        None, description="标定前从各运行原始振动中扣除的轴跳档案 id"
+    )
 
 
 # ---------------------------------------------------------------- 方案
@@ -147,6 +202,7 @@ class WeightOut(BaseModel):
 class SolutionOut(ORMModel):
     id: int
     batch_id: int
+    runout_profile_id: int | None = None
     kind: str
     rank: int
     weights: list[WeightOut]
@@ -154,6 +210,8 @@ class SolutionOut(ORMModel):
     predicted_metric: float
     total_mass: float
     worst_case: float
+    resolution: dict = Field(default_factory=dict)   # 逐测点可分辨范围与不可判定标记
+    runout_compensation: dict | None = None          # 基线轴跳扣除快照
     created_at: datetime
 
 
@@ -161,6 +219,9 @@ class SolveRequest(BaseModel):
     max_weights_per_plane: int = Field(3, ge=1, le=6)
     keep_per_plane: int = Field(120, ge=10, le=2000)
     top: int = Field(10, ge=1, le=100)
+    runout_profile_id: int | None = Field(
+        None, description="求解前先扣除的慢转轴跳档案 id；切换不改写历史标定/方案"
+    )
 
 
 class SolveResponse(BaseModel):
@@ -174,12 +235,19 @@ class SolveResponse(BaseModel):
 class VerificationCreate(BaseModel):
     speed: float = Field(..., gt=0)
     measurements: list[MeasurementIn] = Field(..., min_length=1)
+    phase_reference: str | None = Field(
+        None, description="复测相位基准；须与轴跳档案/方案一致，缺省取批次基线约定"
+    )
+    runout_profile_id: int | None = Field(
+        None, description="复测扣除的轴跳档案 id；缺省沿用方案所用档案"
+    )
     note: str = ""
 
 
 class VerificationOut(ORMModel):
     id: int
     solution_id: int
+    runout_profile_id: int | None = None
     speed: float
     measurements: list[MeasurementIn]
     comparison: dict
