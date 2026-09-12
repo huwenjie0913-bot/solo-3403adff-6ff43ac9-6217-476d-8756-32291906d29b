@@ -253,3 +253,178 @@ class VerificationOut(ORMModel):
     comparison: dict
     note: str
     created_at: datetime
+
+
+# ---------------------------------------------------------------- 加重/去料混合校正
+
+
+class ExistingWeightIn(BaseModel):
+    hole_angle: float = Field(..., description="已有配重所在孔位角度 度")
+    mass: float = Field(..., ge=0, description="已有配重质量 g")
+
+
+class DrillHoleIn(BaseModel):
+    hole_angle: float = Field(..., description="可钻削孔位角度 度")
+    current_thickness: float = Field(..., ge=0, description="当前剩余厚度 mm")
+    removal_limit: float = Field(..., gt=0, description="每孔去料质量上限 g")
+    min_remaining_thickness: float = Field(
+        0.0, ge=0, description="钻后最小允许剩余厚度 mm"
+    )
+
+
+class MixedPlaneIn(BaseModel):
+    """逐面录入的可用加重孔、可钻削孔与已有配重等几何/约束。"""
+
+    plane: str = Field(..., description="校正面名（须与批次配置一致）")
+    add_hole_angles: list[float] = Field(
+        default_factory=list, description="可用加重孔位角度 度"
+    )
+    drill_holes: list[DrillHoleIn] = Field(default_factory=list)
+    existing_weights: list[ExistingWeightIn] = Field(default_factory=list)
+    mass_per_mm: float | None = Field(
+        None, gt=0, description="钻削去料质量/深度换算 g/mm（有钻削孔时必填）"
+    )
+    add_mass_limit: float | None = Field(
+        None, ge=0, description="本次加重总质量上限 g；缺省=批次面质量上限−已有配重"
+    )
+    remove_mass_limit: float | None = Field(
+        None, ge=0, description="本次去料总质量上限 g；缺省=各孔有效上限之和"
+    )
+    change_mass_limit: float | None = Field(
+        None, ge=0, description="单面总改变量(加重+去料)上限 g；缺省不额外绑定"
+    )
+
+    @field_validator("add_hole_angles")
+    @classmethod
+    def _norm_add_angles(cls, v: list[float]) -> list[float]:
+        return sorted({round(a % 360.0, 6) for a in v})
+
+
+class MixedActionIn(BaseModel):
+    plane: str
+    kind: Literal["add", "remove"]
+    hole_angle: float
+    mass: float = Field(..., gt=0, description="加重质量或去料质量 g")
+
+
+class MixedSearchRequest(BaseModel):
+    planes: list[MixedPlaneIn] = Field(..., min_length=2, max_length=2)
+    removal_step: float | None = Field(
+        None, gt=0,
+        description="去料质量离散步长 g；缺省取批次最小配重规格",
+    )
+    calibration_id: int | None = Field(
+        None, description="沿用的标定 id；缺省取与所选轴跳档案匹配的标定，不自动新建"
+    )
+    runout_profile_id: int | None = Field(None)
+    max_weights_per_plane: int = Field(3, ge=1, le=6)
+    keep_per_plane: int = Field(120, ge=10, le=2000)
+    top: int = Field(10, ge=1, le=100)
+
+
+class MixedPlanCreate(MixedSearchRequest):
+    actions: list[MixedActionIn] = Field(
+        ..., description="确认保存的动作方案（逐项复核几何与约束快照）"
+    )
+    candidate_rank: int | None = Field(
+        None, ge=1, description="搜索结果中的候选名次，仅作来源记录"
+    )
+    name: str = ""
+
+
+class ActualMixedActionIn(BaseModel):
+    plane: str
+    kind: Literal["add", "remove"]
+    hole_angle: float
+    mass: float = Field(..., ge=0, description="实际加重/去料质量 g（未执行可为 0）")
+    executed: bool = Field(True, description="该动作是否实际执行")
+
+
+class MixedVerificationCreate(VerificationCreate):
+    actual_actions: list[ActualMixedActionIn] = Field(
+        ..., min_length=1, description="按方案逐项录入的实际加重/去料"
+    )
+
+
+class PlaneSafetyOut(BaseModel):
+    plane: str
+    add_mass: float
+    add_mass_limit: float
+    add_headroom: float
+    remove_mass: float
+    remove_mass_limit: float
+    remove_headroom: float
+    change_mass: float
+    change_mass_limit: float
+    change_headroom: float
+    drill_holes: list[dict] = Field(default_factory=list)
+
+
+class MixedActionOut(BaseModel):
+    plane: str
+    kind: str
+    hole_angle: float
+    mass: float
+    drill_depth: float | None = None
+    remaining_thickness: float | None = None
+    thickness_margin: float | None = None
+
+
+class MixedCandidateOut(BaseModel):
+    rank: int
+    actions: list[MixedActionOut]
+    plane_weights: list[dict]
+    predicted_residual: dict[str, dict[str, float]]
+    predicted_metric: float
+    total_change: float
+    worst_case: float
+    min_safety_margin: float
+    critical_constraint: dict | None = None
+    plane_safety: list[PlaneSafetyOut]
+    action_effects: list[dict]
+    resolution: dict = Field(default_factory=dict)
+
+
+class MixedSearchResponse(BaseModel):
+    calibration_id: int
+    runout_profile_id: int | None = None
+    phase_reference: str | None = None
+    removal_step: float
+    geometry_snapshot: dict
+    candidates: list[MixedCandidateOut]
+
+
+class MixedPlanOut(ORMModel):
+    id: int
+    batch_id: int
+    calibration_id: int
+    runout_profile_id: int | None = None
+    name: str
+    actions: list[dict]
+    predicted_residual: dict[str, dict[str, float]]
+    predicted_metric: float
+    total_change: float
+    worst_case: float
+    min_safety_margin: float
+    critical_constraint: dict | None = None
+    plane_safety: list[dict]
+    action_effects: list[dict]
+    resolution: dict = Field(default_factory=dict)
+    geometry_snapshot: dict
+    constraints_snapshot: dict
+    runout_compensation: dict | None = None
+    note: str
+    created_at: datetime
+    verification_count: int = 0
+
+
+class MixedVerificationOut(ORMModel):
+    id: int
+    plan_id: int
+    runout_profile_id: int | None = None
+    speed: float
+    measurements: list[MeasurementIn]
+    actual_actions: list[dict]
+    reconciliation: dict
+    note: str
+    created_at: datetime

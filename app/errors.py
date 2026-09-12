@@ -56,6 +56,18 @@ class CalibrationMissing(DomainError):
     code = "calibration_missing"
 
 
+class MixedCorrectionConfigError(DomainError):
+    """加重/去料混合校正的几何或约束配置自相矛盾（如孔不可钻、限值为负）。"""
+
+    code = "mixed_correction_config_error"
+
+
+class NoFeasibleMixedCorrection(DomainError):
+    """给定孔位、质量、厚度与单面改变量限制下不存在可行的混合校正候选。"""
+
+    code = "no_feasible_mixed_correction"
+
+
 class RunoutProfileInvalid(DomainError):
     """轴跳档案不满足使用条件（测点缺失、超速、离散度超限等）。"""
 
